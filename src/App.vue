@@ -1,4 +1,4 @@
-﻿<script setup>
+<script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { marked } from 'marked'
 
@@ -11,7 +11,6 @@ const messageListRef = ref(null)
 const messages = ref([])
 const loading = ref(false)
 const fetching = ref(false)
-const typingMessageIndex = ref(-1)
 const requestElapsed = ref(0)
 
 // 会话状态。
@@ -26,6 +25,7 @@ const STORAGE_KEY = 'ai-chat-conversation-id'
 
 // 请求耗时计时器句柄。
 let requestTimer = null
+let streamAbortController = null
 
 // Markdown 渲染配置。
 marked.setOptions({ gfm: true, breaks: true })
@@ -59,9 +59,6 @@ const resetTextarea = () => {
   el.style.height = '24px'
 }
 
-// 异步 sleep，用于打字机效果。
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
-
 // 开始请求耗时计时。
 const startRequestTimer = () => {
   requestElapsed.value = 0
@@ -78,13 +75,6 @@ const stopRequestTimer = () => {
   if (!requestTimer) return
   clearInterval(requestTimer)
   requestTimer = null
-}
-
-// 根据标点动态调整打字速度。
-const getTypingDelay = (char, totalChars) => {
-  const baseDelay = totalChars > 240 ? 14 : 30
-  const punctuation = '，。！？；,.!?;:'
-  return punctuation.includes(char) ? baseDelay + 70 : baseDelay
 }
 
 // 将模型返回统一转换为可展示文本。
@@ -130,37 +120,35 @@ const conversationMeta = (item) => {
   return '暂无消息'
 }
 
-// 以打字机效果输出助手消息。
-const typeAssistantMessage = async (text) => {
-  const content = normalizeAssistantText(text) || '后端未返回内容。'
-  // 先插入一个空白助手消息作为写入目标。
-  const index =
-    messages.value.push({
-      role: 'assistant',
-      content: ''
-    }) - 1
-  typingMessageIndex.value = index
+// 从 SSE 文本缓冲中提取完整事件。
+const parseSseEvents = (buffer) => {
+  const events = []
+  let rest = buffer
 
-  await nextTick()
-  scrollToBottom()
+  while (true) {
+    const index = rest.indexOf('\n\n')
+    if (index < 0) break
 
-  const chars = Array.from(content)
-  try {
-    for (let i = 0; i < chars.length; i += 1) {
-      // 每次追加一个字符。
-      messages.value[index].content += chars[i]
-      if (i % 4 === 0) {
-        // 降低 DOM 刷新频率，避免抖动。
-        await nextTick()
-        scrollToBottom()
-      }
-      await sleep(getTypingDelay(chars[i], chars.length))
+    const raw = rest.slice(0, index)
+    rest = rest.slice(index + 2)
+    const eventText = raw.replace(/\r/g, '').trim()
+    if (!eventText) continue
+
+    const data = eventText
+      .split('\n')
+      .filter((line) => line.startsWith('data:'))
+      .map((line) => line.slice(5).trim())
+      .join('\n')
+    if (!data) continue
+
+    try {
+      events.push(JSON.parse(data))
+    } catch {
+      // 忽略格式异常片段。
     }
-  } finally {
-    typingMessageIndex.value = -1
-    await nextTick()
-    scrollToBottom()
   }
+
+  return { events, rest }
 }
 
 // 保存当前会话 ID（内存 + localStorage）。
@@ -260,14 +248,16 @@ const selectConversation = async (id) => {
     await nextTick()
     scrollToBottom()
   } catch (error) {
-    // 切换失败时也在对话区给出反馈。
-    await typeAssistantMessage(`切换会话失败：${error.message}`)
+    messages.value.push({
+      role: 'assistant',
+      content: `切换会话失败：${error.message}`
+    })
   } finally {
     switchingConversation.value = false
   }
 }
 
-// 发送消息并请求助手回复。
+// 发送消息并流式接收助手回复。
 const send = async () => {
   const content = input.value.trim()
   if (!content || loading.value || switchingConversation.value) return
@@ -288,13 +278,21 @@ const send = async () => {
   await nextTick()
   scrollToBottom()
 
+  let assistantIndex = -1
   try {
-    // 带会话 ID 发送到后端。
-    const res = await fetch(`${API_BASE}/chat`, {
+    assistantIndex =
+      messages.value.push({
+        role: 'assistant',
+        content: ''
+      }) - 1
+
+    streamAbortController = new AbortController()
+    const res = await fetch(`${API_BASE}/chat/stream`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json'
       },
+      signal: streamAbortController.signal,
       body: JSON.stringify({
         conversation_id: conversationId.value,
         content
@@ -304,22 +302,81 @@ const send = async () => {
     if (!res.ok) {
       throw new Error(`请求失败：HTTP ${res.status}`)
     }
+    if (!res.body) {
+      throw new Error('浏览器不支持流式读取')
+    }
 
-    const data = await res.json()
-    saveConversationId(data.conversation_id)
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    let doneConversationId = null
+
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+      const parsed = parseSseEvents(buffer)
+      buffer = parsed.rest
+
+      for (const event of parsed.events) {
+        if (event.type === 'delta') {
+          messages.value[assistantIndex].content += normalizeAssistantText(event.content)
+          if (fetching.value) {
+            fetching.value = false
+            stopRequestTimer()
+          }
+          await nextTick()
+          scrollToBottom()
+          continue
+        }
+        if (event.type === 'done') {
+          doneConversationId = Number(event.conversation_id) || doneConversationId
+          continue
+        }
+        if (event.type === 'error') {
+          throw new Error(event.message || '流式请求失败')
+        }
+      }
+    }
+
+    // 处理流结束后残余片段。
+    buffer += decoder.decode()
+    const tail = parseSseEvents(buffer)
+    for (const event of tail.events) {
+      if (event.type === 'delta') {
+        messages.value[assistantIndex].content += normalizeAssistantText(event.content)
+      } else if (event.type === 'done') {
+        doneConversationId = Number(event.conversation_id) || doneConversationId
+      } else if (event.type === 'error') {
+        throw new Error(event.message || '流式请求失败')
+      }
+    }
+
+    if (!messages.value[assistantIndex].content.trim()) {
+      messages.value[assistantIndex].content = '后端未返回内容。'
+    }
+    if (doneConversationId) {
+      saveConversationId(doneConversationId)
+    }
     await refreshConversationList()
-
-    // 停止等待状态，开始打字机回显。
-    fetching.value = false
-    stopRequestTimer()
-    await typeAssistantMessage(data.answer)
   } catch (error) {
-    // 异常也按助手消息展示，保持上下文连续。
-    fetching.value = false
-    stopRequestTimer()
-    await typeAssistantMessage(`请求异常：${error.message}`)
+    const message = error?.name === 'AbortError' ? '请求已取消。' : `请求异常：${error.message}`
+    if (assistantIndex >= 0 && messages.value[assistantIndex]) {
+      if (messages.value[assistantIndex].content.trim()) {
+        messages.value[assistantIndex].content += `\n\n${message}`
+      } else {
+        messages.value[assistantIndex].content = message
+      }
+    } else {
+      messages.value.push({
+        role: 'assistant',
+        content: message
+      })
+    }
   } finally {
     // 无论成功失败都收敛状态并滚到底部。
+    streamAbortController = null
     fetching.value = false
     stopRequestTimer()
     loading.value = false
@@ -358,8 +415,12 @@ onMounted(async () => {
   }
 })
 
-// 组件卸载时清理计时器。
+// 组件卸载时清理计时器与流连接。
 onBeforeUnmount(() => {
+  if (streamAbortController) {
+    streamAbortController.abort()
+    streamAbortController = null
+  }
   stopRequestTimer()
 })
 </script>
@@ -402,14 +463,12 @@ onBeforeUnmount(() => {
         <div
           v-for="(msg, index) in messages"
           :key="index"
-          :class="['message-row', msg.role, { 'is-typing': index === typingMessageIndex }]"
+          :class="['message-row', msg.role]"
         >
-          <div class="avatar">{{ msg.role === 'user' ? 'U' : 'AI' }}</div>
           <div class="bubble" v-html="renderMarkdown(msg.content)"></div>
         </div>
 
         <div v-if="fetching" class="message-row assistant">
-          <div class="avatar">AI</div>
           <div class="bubble loading-bubble">
             <div class="loading-title">
               正在获取回复
@@ -502,6 +561,7 @@ onBeforeUnmount(() => {
   margin: 0;
   font-size: 15px;
   font-weight: 600;
+  letter-spacing: 0;
 }
 
 .drawer-backdrop {
@@ -644,10 +704,6 @@ onBeforeUnmount(() => {
   background: transparent;
 }
 
-.avatar {
-  display: none;
-}
-
 .bubble {
   width: 100%;
   line-height: 1.7;
@@ -707,12 +763,6 @@ onBeforeUnmount(() => {
   border: 1px solid #e5e7eb;
   border-radius: 6px;
   padding: 1px 6px;
-}
-
-.message-row.assistant.is-typing .bubble::after {
-  content: '|';
-  margin-left: 3px;
-  animation: caret-blink 1s steps(1) infinite;
 }
 
 .loading-bubble {
@@ -831,17 +881,6 @@ onBeforeUnmount(() => {
   cursor: not-allowed;
 }
 
-@keyframes caret-blink {
-  0%,
-  49% {
-    opacity: 1;
-  }
-  50%,
-  100% {
-    opacity: 0;
-  }
-}
-
 @keyframes dot-jump {
   0%,
   80%,
@@ -864,4 +903,3 @@ onBeforeUnmount(() => {
   }
 }
 </style>
-
