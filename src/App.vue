@@ -6,53 +6,95 @@ import { marked } from 'marked'
 const input = ref('')
 const inputRef = ref(null)
 const messageListRef = ref(null)
+const autoScrollEnabled = ref(true)
+const isProgrammaticScroll = ref(false)
+const lastScrollTop = ref(0)
 
 // 聊天消息状态。
 const messages = ref([])
 const loading = ref(false)
 const fetching = ref(false)
+const generating = ref(false)
 const requestElapsed = ref(0)
 
-// 会话状态。
+// 会话与侧边栏状态。
 const conversationId = ref(null)
 const conversations = ref([])
 const switchingConversation = ref(false)
 const drawerOpen = ref(false)
+// 删除会话确认弹窗状态。
+const deleteModalOpen = ref(false)
+const pendingDeleteConversationId = ref(null)
 
-// 接口地址与本地缓存键。
+// 接口与本地缓存键。
 const API_BASE = 'http://127.0.0.1:8000'
 const STORAGE_KEY = 'ai-chat-conversation-id'
 
 // 请求耗时计时器句柄。
 let requestTimer = null
 let streamAbortController = null
+const abortRequested = ref(false)
 
 // Markdown 渲染配置。
 marked.setOptions({ gfm: true, breaks: true })
 
 // 派生 UI 状态。
 const canSend = computed(() => input.value.trim().length > 0 && !loading.value)
-const sendButtonText = computed(() => (fetching.value ? '获取中...' : '发送'))
+const sendButtonText = computed(() => (generating.value ? '中止' : '发送'))
 const elapsedText = computed(() => `${requestElapsed.value.toFixed(1)} 秒`)
 const isBusy = computed(() => loading.value || switchingConversation.value)
 
-// 将消息列表滚动到底部。
-const scrollToBottom = () => {
+// 滚动到底部。force=true 时忽略自动滚动开关。
+const scrollToBottom = (force = false) => {
   const el = messageListRef.value
   if (!el) return
+  if (!force && !autoScrollEnabled.value) return
+  isProgrammaticScroll.value = true
   el.scrollTop = el.scrollHeight + 1000
+  requestAnimationFrame(() => {
+    const target = messageListRef.value
+    if (!target) return
+    lastScrollTop.value = target.scrollTop
+    isProgrammaticScroll.value = false
+  })
 }
 
-// 输入时自动调整文本框高度。
+// 监听消息区滚动，控制是否自动跟随到底部。
+const handleMessagesScroll = () => {
+  const el = messageListRef.value
+  if (!el) return
+  if (isProgrammaticScroll.value) return
+
+  const currentTop = el.scrollTop
+  const scrollingUp = currentTop < lastScrollTop.value
+  lastScrollTop.value = currentTop
+
+  // 用户只要向上滚动，就锁定自动滚动，避免抖动和回拉。
+  if (scrollingUp) {
+    autoScrollEnabled.value = false
+    return
+  }
+
+  const distanceToBottom = el.scrollHeight - el.scrollTop - el.clientHeight
+  // 仅在非常接近底部时恢复自动滚动（带滞回，避免抖动）。
+  if (!autoScrollEnabled.value && distanceToBottom <= 16) {
+    autoScrollEnabled.value = true
+    return
+  }
+  if (autoScrollEnabled.value && distanceToBottom > 120) {
+    autoScrollEnabled.value = false
+  }
+}
+
+// 根据内容自动调整输入框高度。
 const resizeTextarea = () => {
   const el = inputRef.value
   if (!el) return
-  // 先重置高度，再根据内容撑开。
   el.style.height = '24px'
   el.style.height = `${Math.min(el.scrollHeight, 160)}px`
 }
 
-// 发送后恢复单行高度。
+// 发送后重置输入框高度。
 const resetTextarea = () => {
   const el = inputRef.value
   if (!el) return
@@ -64,7 +106,6 @@ const startRequestTimer = () => {
   requestElapsed.value = 0
   if (requestTimer) clearInterval(requestTimer)
   const startAt = Date.now()
-  // 每 100ms 刷新一次耗时展示。
   requestTimer = setInterval(() => {
     requestElapsed.value = (Date.now() - startAt) / 1000
   }, 100)
@@ -77,7 +118,7 @@ const stopRequestTimer = () => {
   requestTimer = null
 }
 
-// 将模型返回统一转换为可展示文本。
+// 统一把任意类型内容转为可展示字符串。
 const normalizeAssistantText = (value) => {
   if (typeof value === 'string') return value
   if (value == null) return ''
@@ -91,10 +132,10 @@ const normalizeAssistantText = (value) => {
   return String(value)
 }
 
-// Markdown 文本转 HTML。
+// Markdown 转 HTML。
 const renderMarkdown = (value) => marked.parse(normalizeAssistantText(value))
 
-// 生成会话列表中的简短预览文本。
+// 生成侧边栏预览文案。
 const previewText = (value, fallback) => {
   const text = normalizeAssistantText(value).replace(/\s+/g, ' ').trim()
   if (!text) return fallback
@@ -120,7 +161,7 @@ const conversationMeta = (item) => {
   return '暂无消息'
 }
 
-// 从 SSE 文本缓冲中提取完整事件。
+// 解析 SSE 缓冲，提取完整 data 事件。
 const parseSseEvents = (buffer) => {
   const events = []
   let rest = buffer
@@ -158,17 +199,15 @@ const saveConversationId = (id) => {
   localStorage.setItem(STORAGE_KEY, String(id))
 }
 
-// 拉取侧边栏会话列表。
+// 拉取会话列表。
 const refreshConversationList = async () => {
   const res = await fetch(`${API_BASE}/conversations`)
-  if (!res.ok) {
-    throw new Error(`加载会话列表失败：HTTP ${res.status}`)
-  }
+  if (!res.ok) throw new Error(`加载会话列表失败：HTTP ${res.status}`)
   const data = await res.json()
   conversations.value = data.conversations || []
 }
 
-// 用后端返回的数据重建消息列表。
+// 用后端消息重建前端消息列表。
 const hydrateMessages = (items) => {
   messages.value = (items || []).map((item) => ({
     role: item.role,
@@ -176,18 +215,16 @@ const hydrateMessages = (items) => {
   }))
 }
 
-// 加载指定会话并切换上下文。
+// 加载指定会话。
 const loadConversation = async (id) => {
   const res = await fetch(`${API_BASE}/conversations/${id}/messages`)
-  if (!res.ok) {
-    throw new Error(`加载会话失败：HTTP ${res.status}`)
-  }
+  if (!res.ok) throw new Error(`加载会话失败：HTTP ${res.status}`)
   const data = await res.json()
   hydrateMessages(data.messages)
   saveConversationId(data.conversation_id)
 }
 
-// 启动初始化：优先恢复本地会话，失败则加载后端最新会话。
+// 初始化会话：优先本地缓存，失败回退到后端最新会话。
 const initConversation = async () => {
   await refreshConversationList()
 
@@ -197,7 +234,7 @@ const initConversation = async () => {
     try {
       await loadConversation(Number(saved))
       await nextTick()
-      scrollToBottom()
+      scrollToBottom(true)
       return
     } catch {
       // 缓存失效则清掉。
@@ -207,9 +244,7 @@ const initConversation = async () => {
 
   // 回退到后端最新会话。
   const res = await fetch(`${API_BASE}/conversations/latest`)
-  if (!res.ok) {
-    throw new Error(`初始化会话失败：HTTP ${res.status}`)
-  }
+  if (!res.ok) throw new Error(`初始化会话失败：HTTP ${res.status}`)
 
   const data = await res.json()
   hydrateMessages(data.messages)
@@ -217,26 +252,23 @@ const initConversation = async () => {
   await refreshConversationList()
 
   await nextTick()
-  scrollToBottom()
+  scrollToBottom(true)
 }
 
-// 创建新会话并切换到该会话。
+// 创建新会话。
 const createConversation = async () => {
   const res = await fetch(`${API_BASE}/conversations`, { method: 'POST' })
-  if (!res.ok) {
-    throw new Error(`新建会话失败：HTTP ${res.status}`)
-  }
+  if (!res.ok) throw new Error(`新建会话失败：HTTP ${res.status}`)
   const data = await res.json()
   messages.value = []
   saveConversationId(data.conversation_id)
   await refreshConversationList()
   drawerOpen.value = false
-
   await nextTick()
-  scrollToBottom()
+  scrollToBottom(true)
 }
 
-// 从侧边栏切换会话。
+// 选择并切换会话。
 const selectConversation = async (id) => {
   const nextId = Number(id)
   if (!nextId || nextId === conversationId.value || switchingConversation.value) return
@@ -246,7 +278,7 @@ const selectConversation = async (id) => {
     await loadConversation(nextId)
     drawerOpen.value = false
     await nextTick()
-    scrollToBottom()
+    scrollToBottom(true)
   } catch (error) {
     messages.value.push({
       role: 'assistant',
@@ -257,29 +289,87 @@ const selectConversation = async (id) => {
   }
 }
 
-// 发送消息并流式接收助手回复。
+// 打开删除会话确认弹窗。
+const requestDeleteConversation = (id) => {
+  const targetId = Number(id)
+  if (!targetId || isBusy.value) return
+  pendingDeleteConversationId.value = targetId
+  deleteModalOpen.value = true
+}
+
+// 取消删除会话。
+const cancelDeleteConversation = () => {
+  deleteModalOpen.value = false
+  pendingDeleteConversationId.value = null
+}
+
+// 执行删除会话。
+const deleteConversation = async () => {
+  const targetId = Number(pendingDeleteConversationId.value)
+  if (!targetId || isBusy.value) {
+    cancelDeleteConversation()
+    return
+  }
+
+  try {
+    const res = await fetch(`${API_BASE}/conversations/${targetId}`, {
+      method: 'DELETE'
+    })
+    if (!res.ok) throw new Error(`删除会话失败：HTTP ${res.status}`)
+
+    if (conversationId.value === targetId) {
+      const latestRes = await fetch(`${API_BASE}/conversations/latest`)
+      if (!latestRes.ok) throw new Error(`加载会话失败：HTTP ${latestRes.status}`)
+      const data = await latestRes.json()
+      hydrateMessages(data.messages)
+      saveConversationId(data.conversation_id)
+      await refreshConversationList()
+      await nextTick()
+      scrollToBottom(true)
+      return
+    }
+
+    await refreshConversationList()
+  } catch (error) {
+    messages.value.push({
+      role: 'assistant',
+      content: `删除会话失败：${error.message}`
+    })
+  } finally {
+    cancelDeleteConversation()
+  }
+}
+
+// 主动中止当前流式回复。
+const stopGenerating = () => {
+  if (!streamAbortController) return
+  abortRequested.value = true
+  generating.value = false
+  fetching.value = false
+  stopRequestTimer()
+  streamAbortController.abort()
+}
+
+// 发送消息并流式接收回复。
 const send = async () => {
   const content = input.value.trim()
   if (!content || loading.value || switchingConversation.value) return
 
-  // 先本地插入用户消息，提升交互响应。
-  messages.value.push({
-    role: 'user',
-    content
-  })
-
-  // 清空输入并进入请求状态。
+  messages.value.push({ role: 'user', content })
   input.value = ''
   resetTextarea()
   loading.value = true
   fetching.value = true
+  generating.value = true
+  autoScrollEnabled.value = true
   startRequestTimer()
 
   await nextTick()
-  scrollToBottom()
+  scrollToBottom(true)
 
   let assistantIndex = -1
   try {
+    abortRequested.value = false
     assistantIndex =
       messages.value.push({
         role: 'assistant',
@@ -289,9 +379,7 @@ const send = async () => {
     streamAbortController = new AbortController()
     const res = await fetch(`${API_BASE}/chat/stream`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
+      headers: { 'Content-Type': 'application/json' },
       signal: streamAbortController.signal,
       body: JSON.stringify({
         conversation_id: conversationId.value,
@@ -299,12 +387,8 @@ const send = async () => {
       })
     })
 
-    if (!res.ok) {
-      throw new Error(`请求失败：HTTP ${res.status}`)
-    }
-    if (!res.body) {
-      throw new Error('浏览器不支持流式读取')
-    }
+    if (!res.ok) throw new Error(`请求失败：HTTP ${res.status}`)
+    if (!res.body) throw new Error('浏览器不支持流式读取')
 
     const reader = res.body.getReader()
     const decoder = new TextDecoder()
@@ -314,7 +398,6 @@ const send = async () => {
     while (true) {
       const { value, done } = await reader.read()
       if (done) break
-
       buffer += decoder.decode(value, { stream: true })
       const parsed = parseSseEvents(buffer)
       buffer = parsed.rest
@@ -334,13 +417,10 @@ const send = async () => {
           doneConversationId = Number(event.conversation_id) || doneConversationId
           continue
         }
-        if (event.type === 'error') {
-          throw new Error(event.message || '流式请求失败')
-        }
+        if (event.type === 'error') throw new Error(event.message || '流式请求失败')
       }
     }
 
-    // 处理流结束后残余片段。
     buffer += decoder.decode()
     const tail = parseSseEvents(buffer)
     for (const event of tail.events) {
@@ -356,27 +436,31 @@ const send = async () => {
     if (!messages.value[assistantIndex].content.trim()) {
       messages.value[assistantIndex].content = '后端未返回内容。'
     }
-    if (doneConversationId) {
-      saveConversationId(doneConversationId)
-    }
+    if (doneConversationId) saveConversationId(doneConversationId)
     await refreshConversationList()
   } catch (error) {
-    const message = error?.name === 'AbortError' ? '请求已取消。' : `请求异常：${error.message}`
-    if (assistantIndex >= 0 && messages.value[assistantIndex]) {
-      if (messages.value[assistantIndex].content.trim()) {
-        messages.value[assistantIndex].content += `\n\n${message}`
-      } else {
-        messages.value[assistantIndex].content = message
+    if (error?.name === 'AbortError' && abortRequested.value) {
+      if (assistantIndex >= 0 && messages.value[assistantIndex] && !messages.value[assistantIndex].content.trim()) {
+        messages.value.splice(assistantIndex, 1)
       }
+      await refreshConversationList()
     } else {
-      messages.value.push({
-        role: 'assistant',
-        content: message
-      })
+      const message = `请求异常：${error.message}`
+      if (assistantIndex >= 0 && messages.value[assistantIndex]) {
+        if (messages.value[assistantIndex].content.trim()) {
+          messages.value[assistantIndex].content += `\n\n${message}`
+        } else {
+          messages.value[assistantIndex].content = message
+        }
+      } else {
+        messages.value.push({ role: 'assistant', content: message })
+      }
+      await refreshConversationList()
     }
   } finally {
-    // 无论成功失败都收敛状态并滚到底部。
+    abortRequested.value = false
     streamAbortController = null
+    generating.value = false
     fetching.value = false
     stopRequestTimer()
     loading.value = false
@@ -385,29 +469,32 @@ const send = async () => {
   }
 }
 
-// Enter 发送；Shift+Enter 换行。
+// Enter 发送；正在生成时 Enter 触发中止。
 const handleEnter = (event) => {
   if (event.shiftKey) return
   event.preventDefault()
+  if (generating.value) {
+    stopGenerating()
+    return
+  }
   send()
 }
 
-// 顶部按钮切换抽屉显隐。
+// 抽屉开关。
 const toggleDrawer = () => {
   drawerOpen.value = !drawerOpen.value
 }
 
-// 点击遮罩关闭抽屉。
+// 关闭抽屉。
 const closeDrawer = () => {
   drawerOpen.value = false
 }
 
-// 组件挂载时初始化会话。
+// 组件挂载：初始化会话。
 onMounted(async () => {
   try {
     await initConversation()
   } catch (error) {
-    // 初始化失败时在消息区显示错误。
     messages.value.push({
       role: 'assistant',
       content: `初始化失败：${error.message}`
@@ -415,7 +502,7 @@ onMounted(async () => {
   }
 })
 
-// 组件卸载时清理计时器与流连接。
+// 组件卸载：清理计时器与流式连接。
 onBeforeUnmount(() => {
   if (streamAbortController) {
     streamAbortController.abort()
@@ -440,31 +527,46 @@ onBeforeUnmount(() => {
       </div>
 
       <div class="conversation-list">
-        <button
+        <div
           v-for="item in conversations"
           :key="item.id"
           class="conversation-item"
           :class="{ active: Number(item.id) === conversationId }"
-          :disabled="isBusy"
-          @click="selectConversation(item.id)"
+          :aria-disabled="isBusy"
         >
-          <div class="title">{{ conversationTitle(item) }}</div>
-          <div class="meta">{{ conversationMeta(item) }}</div>
-        </button>
-
+          <button class="conversation-main" :disabled="isBusy" @click="selectConversation(item.id)">
+            <div class="title">{{ conversationTitle(item) }}</div>
+            <div class="meta">{{ conversationMeta(item) }}</div>
+          </button>
+          <button
+            class="conversation-delete"
+            :disabled="isBusy"
+            @click="requestDeleteConversation(item.id)"
+            title="删除会话"
+          >
+            删除
+          </button>
+        </div>
         <div v-if="conversations.length === 0" class="empty-conversations">暂无对话</div>
       </div>
     </aside>
 
+    <div v-if="deleteModalOpen" class="modal-backdrop" @click="cancelDeleteConversation">
+      <div class="confirm-modal" @click.stop>
+        <h3>确认删除会话</h3>
+        <p>删除后将无法恢复，确定继续吗？</p>
+        <div class="modal-actions">
+          <button class="modal-btn secondary" :disabled="isBusy" @click="cancelDeleteConversation">取消</button>
+          <button class="modal-btn danger" :disabled="isBusy" @click="deleteConversation">删除</button>
+        </div>
+      </div>
+    </div>
+
     <main class="chat-panel">
-      <section ref="messageListRef" class="messages">
+      <section ref="messageListRef" class="messages" @scroll="handleMessagesScroll">
         <div v-if="messages.length === 0" class="empty-state">开始一个新对话</div>
 
-        <div
-          v-for="(msg, index) in messages"
-          :key="index"
-          :class="['message-row', msg.role]"
-        >
+        <div v-for="(msg, index) in messages" :key="index" :class="['message-row', msg.role]">
           <div class="bubble" v-html="renderMarkdown(msg.content)"></div>
         </div>
 
@@ -472,9 +574,7 @@ onBeforeUnmount(() => {
           <div class="bubble loading-bubble">
             <div class="loading-title">
               正在获取回复
-              <span class="loading-dots">
-                <i></i><i></i><i></i>
-              </span>
+              <span class="loading-dots"><i></i><i></i><i></i></span>
             </div>
             <div class="loading-subtitle">已等待 {{ elapsedText }}</div>
             <div class="loading-track"><span></span></div>
@@ -493,7 +593,12 @@ onBeforeUnmount(() => {
             @input="resizeTextarea"
             :disabled="switchingConversation"
           ></textarea>
-          <button :disabled="!canSend || switchingConversation" class="send-btn" :class="{ loading: fetching }" @click="send">
+          <button
+            :disabled="switchingConversation || (!canSend && !generating)"
+            class="send-btn"
+            :class="{ loading: fetching }"
+            @click="generating ? stopGenerating() : send()"
+          >
             {{ sendButtonText }}
           </button>
         </div>
@@ -571,6 +676,75 @@ onBeforeUnmount(() => {
   z-index: 20;
 }
 
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  background: rgba(15, 23, 42, 0.42);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+
+.confirm-modal {
+  width: min(420px, 100%);
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  padding: 16px;
+  box-shadow: 0 20px 60px rgba(15, 23, 42, 0.25);
+}
+
+.confirm-modal h3 {
+  margin: 0;
+  font-size: 16px;
+  color: #111827;
+}
+
+.confirm-modal p {
+  margin: 10px 0 0;
+  font-size: 13px;
+  color: #4b5563;
+  line-height: 1.6;
+}
+
+.modal-actions {
+  margin-top: 14px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.modal-btn {
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+  background: #ffffff;
+  color: #111827;
+  font-weight: 600;
+}
+
+.modal-btn.secondary:hover {
+  background: #f9fafb;
+}
+
+.modal-btn.danger {
+  border-color: #fca5a5;
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.modal-btn.danger:hover {
+  background: #fecaca;
+}
+
+.modal-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 .drawer {
   position: fixed;
   top: 0;
@@ -625,13 +799,11 @@ onBeforeUnmount(() => {
 }
 
 .conversation-item {
-  border: none;
-  background: transparent;
-  color: #111827;
-  text-align: left;
+  display: flex;
+  align-items: center;
+  gap: 8px;
   border-radius: 8px;
-  padding: 10px;
-  cursor: pointer;
+  padding: 6px;
 }
 
 .conversation-item:hover {
@@ -647,14 +819,48 @@ onBeforeUnmount(() => {
   opacity: 0.7;
 }
 
-.conversation-item .title {
+.conversation-main {
+  border: none;
+  background: transparent;
+  color: #111827;
+  text-align: left;
+  cursor: pointer;
+  flex: 1;
+  padding: 4px;
+}
+
+.conversation-main:disabled {
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+
+.conversation-delete {
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #b91c1c;
+  font-size: 11px;
+  padding: 4px 6px;
+  cursor: pointer;
+}
+
+.conversation-delete:hover {
+  background: #fef2f2;
+}
+
+.conversation-delete:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.conversation-main .title {
   font-size: 13px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.conversation-item .meta {
+.conversation-main .meta {
   margin-top: 4px;
   font-size: 11px;
   color: #6b7280;
@@ -873,7 +1079,7 @@ onBeforeUnmount(() => {
 }
 
 .send-btn.loading {
-  background: #1f2937;
+  background: #7f1d1d;
 }
 
 .send-btn:disabled {
