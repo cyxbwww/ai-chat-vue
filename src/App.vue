@@ -193,7 +193,28 @@ const normalizeAssistantText = (value) => {
 }
 
 // Markdown 转 HTML。
-const renderMarkdown = (value) => marked.parse(normalizeAssistantText(value))
+const unwrapPseudoMarkdownFence = (value) => {
+  const text = normalizeAssistantText(value)
+  const normalized = text.replace(/\r\n?/g, '\n')
+  const nonCodeLangs = new Set(['', 'markdown', 'md', 'mdown', 'mkd', 'text', 'txt', 'plain', 'plaintext'])
+  const likelyCode = (body) =>
+    /(^|\n)\s{0,3}(const|let|var|function|class|import|export|if|for|while|return|def|public|private)\b|=>|[;{}()]|<\/?[a-z][^>]*>/i.test(
+      body
+    )
+  const shouldUnwrap = (lang, body) => {
+    const normalizedLang = (lang || '').trim().toLowerCase()
+    if (!nonCodeLangs.has(normalizedLang)) return false
+    if (normalizedLang) return true
+    return !likelyCode(body)
+  }
+
+  return normalized.replace(/```([^\n`]*)\n([\s\S]*?)\n```/g, (raw, lang, body) => {
+    if (!shouldUnwrap(lang, body)) return raw
+    return body.trimEnd()
+  })
+}
+
+const renderMarkdown = (value) => marked.parse(unwrapPseudoMarkdownFence(value))
 
 const findLastAssistantIndex = () => {
   for (let i = messages.value.length - 1; i >= 0; i -= 1) {
