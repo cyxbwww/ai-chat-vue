@@ -15,6 +15,7 @@ const messages = ref([])
 const loading = ref(false)
 const fetching = ref(false)
 const generating = ref(false)
+const canContinue = ref(false)
 const requestElapsed = ref(0)
 
 // 会话与侧边栏状态。
@@ -99,6 +100,7 @@ watch(systemPromptPreset, (value) => {
 // 派生 UI 状态。
 const canSend = computed(() => input.value.trim().length > 0 && !loading.value)
 const sendButtonText = computed(() => (generating.value ? '中止' : '发送'))
+const continueButtonText = computed(() => (generating.value ? '正在续写...' : '继续生成'))
 const elapsedText = computed(() => `${requestElapsed.value.toFixed(1)} 秒`)
 const isBusy = computed(() => loading.value || switchingConversation.value)
 
@@ -193,6 +195,28 @@ const normalizeAssistantText = (value) => {
 // Markdown 转 HTML。
 const renderMarkdown = (value) => marked.parse(normalizeAssistantText(value))
 
+const findLastAssistantIndex = () => {
+  for (let i = messages.value.length - 1; i >= 0; i -= 1) {
+    if (messages.value[i]?.role === 'assistant') return i
+  }
+  return -1
+}
+
+const appendWithoutOverlap = (baseText, incomingText) => {
+  const base = normalizeAssistantText(baseText)
+  const incoming = normalizeAssistantText(incomingText)
+  if (!incoming) return base
+  if (!base) return incoming
+
+  const maxOverlap = Math.min(base.length, incoming.length, 120)
+  for (let size = maxOverlap; size > 0; size -= 1) {
+    if (base.endsWith(incoming.slice(0, size))) {
+      return base + incoming.slice(size)
+    }
+  }
+  return base + incoming
+}
+
 // 生成侧边栏预览文案。
 const previewText = (value, fallback) => {
   const text = normalizeAssistantText(value).replace(/\s+/g, ' ').trim()
@@ -271,6 +295,7 @@ const hydrateMessages = (items) => {
     role: item.role,
     content: item.content
   }))
+  canContinue.value = false
 }
 
 // 加载指定会话。
@@ -319,6 +344,7 @@ const createConversation = async () => {
   if (!res.ok) throw new Error(`新建会话失败：HTTP ${res.status}`)
   const data = await res.json()
   messages.value = []
+  canContinue.value = false
   saveConversationId(data.conversation_id)
   await refreshConversationList()
   drawerOpen.value = false
@@ -408,14 +434,11 @@ const stopGenerating = () => {
   streamAbortController.abort()
 }
 
-// 发送消息并流式接收回复。
-const send = async () => {
-  const content = input.value.trim()
-  if (!content || loading.value || switchingConversation.value) return
+const streamChat = async ({ content = '', continueFromLast = false } = {}) => {
+  let assistantIndex = -1
+  let doneTruncated = false
+  const messageContent = (content || '').trim()
 
-  messages.value.push({ role: 'user', content })
-  input.value = ''
-  resetTextarea()
   loading.value = true
   fetching.value = true
   generating.value = true
@@ -425,26 +448,39 @@ const send = async () => {
   await nextTick()
   scrollToBottom(true)
 
-  let assistantIndex = -1
   try {
     abortRequested.value = false
-    assistantIndex =
-      messages.value.push({
-        role: 'assistant',
-        content: ''
-      }) - 1
+    if (continueFromLast) {
+      assistantIndex = findLastAssistantIndex()
+      if (assistantIndex < 0) {
+        assistantIndex =
+          messages.value.push({
+            role: 'assistant',
+            content: ''
+          }) - 1
+      }
+    } else {
+      assistantIndex =
+        messages.value.push({
+          role: 'assistant',
+          content: ''
+        }) - 1
+    }
 
     streamAbortController = new AbortController()
+    const body = {
+      conversation_id: conversationId.value,
+      continue_from_last: continueFromLast,
+      system_prompt: systemPrompt.value,
+      system_prompt_preset: systemPromptPreset.value === CUSTOM_PRESET_KEY ? null : systemPromptPreset.value
+    }
+    if (!continueFromLast) body.content = messageContent
+
     const res = await fetch(`${API_BASE}/chat/stream`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       signal: streamAbortController.signal,
-      body: JSON.stringify({
-        conversation_id: conversationId.value,
-        content,
-        system_prompt: systemPrompt.value,
-        system_prompt_preset: systemPromptPreset.value === CUSTOM_PRESET_KEY ? null : systemPromptPreset.value
-      })
+      body: JSON.stringify(body)
     })
 
     if (!res.ok) throw new Error(`请求失败：HTTP ${res.status}`)
@@ -464,7 +500,12 @@ const send = async () => {
 
       for (const event of parsed.events) {
         if (event.type === 'delta') {
-          messages.value[assistantIndex].content += normalizeAssistantText(event.content)
+          const deltaText = normalizeAssistantText(event.content)
+          if (continueFromLast) {
+            messages.value[assistantIndex].content = appendWithoutOverlap(messages.value[assistantIndex].content, deltaText)
+          } else {
+            messages.value[assistantIndex].content += deltaText
+          }
           if (fetching.value) {
             fetching.value = false
             stopRequestTimer()
@@ -475,6 +516,7 @@ const send = async () => {
         }
         if (event.type === 'done') {
           doneConversationId = Number(event.conversation_id) || doneConversationId
+          doneTruncated = Boolean(event.truncated)
           continue
         }
         if (event.type === 'error') throw new Error(event.message || '流式请求失败')
@@ -485,9 +527,15 @@ const send = async () => {
     const tail = parseSseEvents(buffer)
     for (const event of tail.events) {
       if (event.type === 'delta') {
-        messages.value[assistantIndex].content += normalizeAssistantText(event.content)
+        const deltaText = normalizeAssistantText(event.content)
+        if (continueFromLast) {
+          messages.value[assistantIndex].content = appendWithoutOverlap(messages.value[assistantIndex].content, deltaText)
+        } else {
+          messages.value[assistantIndex].content += deltaText
+        }
       } else if (event.type === 'done') {
         doneConversationId = Number(event.conversation_id) || doneConversationId
+        doneTruncated = Boolean(event.truncated)
       } else if (event.type === 'error') {
         throw new Error(event.message || '流式请求失败')
       }
@@ -496,15 +544,17 @@ const send = async () => {
     if (!messages.value[assistantIndex].content.trim()) {
       messages.value[assistantIndex].content = '后端未返回内容。'
     }
+    canContinue.value = doneTruncated
     if (doneConversationId) saveConversationId(doneConversationId)
     await refreshConversationList()
   } catch (error) {
     if (error?.name === 'AbortError' && abortRequested.value) {
-      if (assistantIndex >= 0 && messages.value[assistantIndex] && !messages.value[assistantIndex].content.trim()) {
+      if (!continueFromLast && assistantIndex >= 0 && messages.value[assistantIndex] && !messages.value[assistantIndex].content.trim()) {
         messages.value.splice(assistantIndex, 1)
       }
       await refreshConversationList()
     } else {
+      canContinue.value = false
       const message = `请求异常：${error.message}`
       if (assistantIndex >= 0 && messages.value[assistantIndex]) {
         if (messages.value[assistantIndex].content.trim()) {
@@ -527,6 +577,24 @@ const send = async () => {
     await nextTick()
     scrollToBottom()
   }
+}
+
+// 发送消息并流式接收回复。
+const send = async () => {
+  const content = input.value.trim()
+  if (!content || loading.value || switchingConversation.value) return
+
+  canContinue.value = false
+  messages.value.push({ role: 'user', content })
+  input.value = ''
+  resetTextarea()
+  await streamChat({ content, continueFromLast: false })
+}
+
+const continueGenerating = async () => {
+  if (!canContinue.value || loading.value || switchingConversation.value) return
+  canContinue.value = false
+  await streamChat({ continueFromLast: true })
 }
 
 // Enter 发送；正在生成时 Enter 触发中止。
@@ -643,6 +711,16 @@ onBeforeUnmount(() => {
       </section>
 
       <footer class="composer-wrap">
+        <div v-if="canContinue" class="continue-wrap">
+          <button
+            class="continue-btn"
+            :disabled="loading || switchingConversation"
+            @click="continueGenerating"
+          >
+            {{ continueButtonText }}
+          </button>
+        </div>
+
         <div class="system-prompt-box">
           <div class="system-prompt-head">
             <div class="system-prompt-tools">
@@ -1128,6 +1206,30 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+
+.continue-wrap {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.continue-btn {
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  padding: 7px 12px;
+  background: #ffffff;
+  color: #111827;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.continue-btn:hover {
+  background: #f9fafb;
+}
+
+.continue-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 .system-prompt-box {
