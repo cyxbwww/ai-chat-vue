@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { marked } from 'marked'
 
 // 输入框与 DOM 引用。
@@ -29,6 +29,56 @@ const pendingDeleteConversationId = ref(null)
 // 接口与本地缓存键。
 const API_BASE = 'http://127.0.0.1:8000'
 const STORAGE_KEY = 'ai-chat-conversation-id'
+const SYSTEM_PROMPT_KEY = 'ai-chat-system-prompt'
+const SYSTEM_PROMPT_PRESET_KEY = 'ai-chat-system-prompt-preset'
+const systemPrompt = ref(localStorage.getItem(SYSTEM_PROMPT_KEY) || '')
+const CUSTOM_PRESET_KEY = 'custom'
+const systemPromptPresets = [
+  {
+    key: 'general',
+    label: '通用助手',
+    prompt: '你是一个通用 AI 助手。请用中文回答，表达清晰、简洁，优先给出可执行建议。'
+  },
+  {
+    key: 'coding',
+    label: '编程助手',
+    prompt:
+      '你是一名资深编程助手。请用中文回答，先给可运行方案，再补充关键原理与边界条件，代码尽量简洁。'
+  },
+  {
+    key: 'interview',
+    label: '面试助手',
+    prompt:
+      '你是一名面试助手。请用中文回答，按“思路-要点-示例”结构给出答案，突出重点并提供可复述的表达。'
+  },
+  {
+    key: 'translation',
+    label: '翻译助手',
+    prompt: '你是一名翻译助手。请准确翻译并保留原意与语气；如有歧义，给出更自然的候选译法。'
+  }
+]
+const systemPromptPreset = ref(localStorage.getItem(SYSTEM_PROMPT_PRESET_KEY) || 'general')
+
+const findPresetByKey = (key) => systemPromptPresets.find((item) => item.key === key)
+const matchPresetByPrompt = (value) => {
+  const normalized = (value || '').trim()
+  if (!normalized) return null
+  return systemPromptPresets.find((item) => item.prompt === normalized) || null
+}
+const applySystemPromptPreset = (key) => {
+  const preset = findPresetByKey(key)
+  if (!preset) return
+  systemPrompt.value = preset.prompt
+}
+
+const matchedPreset = matchPresetByPrompt(systemPrompt.value)
+if (matchedPreset) {
+  systemPromptPreset.value = matchedPreset.key
+} else if (!systemPrompt.value.trim()) {
+  applySystemPromptPreset(systemPromptPreset.value)
+} else {
+  systemPromptPreset.value = CUSTOM_PRESET_KEY
+}
 
 // 请求耗时计时器句柄。
 let requestTimer = null
@@ -37,6 +87,14 @@ const abortRequested = ref(false)
 
 // Markdown 渲染配置。
 marked.setOptions({ gfm: true, breaks: true })
+watch(systemPrompt, (value) => {
+  localStorage.setItem(SYSTEM_PROMPT_KEY, value)
+  const matched = matchPresetByPrompt(value)
+  systemPromptPreset.value = matched ? matched.key : CUSTOM_PRESET_KEY
+})
+watch(systemPromptPreset, (value) => {
+  localStorage.setItem(SYSTEM_PROMPT_PRESET_KEY, value)
+})
 
 // 派生 UI 状态。
 const canSend = computed(() => input.value.trim().length > 0 && !loading.value)
@@ -383,7 +441,9 @@ const send = async () => {
       signal: streamAbortController.signal,
       body: JSON.stringify({
         conversation_id: conversationId.value,
-        content
+        content,
+        system_prompt: systemPrompt.value,
+        system_prompt_preset: systemPromptPreset.value === CUSTOM_PRESET_KEY ? null : systemPromptPreset.value
       })
     })
 
@@ -583,6 +643,41 @@ onBeforeUnmount(() => {
       </section>
 
       <footer class="composer-wrap">
+        <div class="system-prompt-box">
+          <div class="system-prompt-head">
+            <div class="system-prompt-tools">
+              <span>角色系统 Prompt</span>
+              <select
+                v-model="systemPromptPreset"
+                class="system-prompt-select"
+                :disabled="loading || switchingConversation"
+                @change="systemPromptPreset !== CUSTOM_PRESET_KEY && applySystemPromptPreset(systemPromptPreset)"
+              >
+                <option :value="CUSTOM_PRESET_KEY">自定义</option>
+                <option v-for="preset in systemPromptPresets" :key="preset.key" :value="preset.key">
+                  {{ preset.label }}
+                </option>
+              </select>
+            </div>
+            <button
+              class="system-prompt-clear"
+              :disabled="loading || switchingConversation || !systemPrompt.trim()"
+              @click="
+                systemPrompt = '';
+                systemPromptPreset = CUSTOM_PRESET_KEY
+              "
+            >
+              清空
+            </button>
+          </div>
+          <textarea
+            v-model="systemPrompt"
+            rows="2"
+            placeholder="例如：你是一名严谨、简洁的技术助手，请优先使用中文回答。"
+            :disabled="loading || switchingConversation"
+          ></textarea>
+        </div>
+
         <div class="composer">
           <textarea
             ref="inputRef"
@@ -885,7 +980,7 @@ onBeforeUnmount(() => {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 82px 0 128px;
+  padding: 82px 0 18px;
   background: #ffffff;
 }
 
@@ -1026,14 +1121,97 @@ onBeforeUnmount(() => {
 }
 
 .composer-wrap {
-  position: fixed;
-  left: 0;
-  right: 0;
-  bottom: 14px;
-  z-index: 5;
+  position: relative;
   border-top: none;
-  padding: 0 16px;
-  background: transparent;
+  padding: 8px 16px 14px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0) 0%, #ffffff 28%);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.system-prompt-box {
+  border: 1px solid #d1d5db;
+  border-radius: 12px;
+  background: #ffffff;
+  padding: 10px;
+  box-shadow: 0 8px 20px rgba(15, 23, 42, 0.08);
+}
+
+.system-prompt-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: #374151;
+  font-weight: 600;
+}
+
+.system-prompt-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.system-prompt-select {
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #111827;
+  font-size: 12px;
+  padding: 4px 6px;
+  outline: none;
+}
+
+.system-prompt-select:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.system-prompt-clear {
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #111827;
+  font-size: 12px;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+
+.system-prompt-clear:hover {
+  background: #f9fafb;
+}
+
+.system-prompt-clear:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.system-prompt-box textarea {
+  width: 100%;
+  min-height: 52px;
+  max-height: 140px;
+  resize: vertical;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 8px 10px;
+  outline: none;
+  font: inherit;
+  line-height: 1.5;
+  color: #111827;
+  background: #ffffff;
+}
+
+.system-prompt-box textarea::placeholder {
+  color: #9ca3af;
+}
+
+.system-prompt-box textarea:disabled {
+  background: #f9fafb;
+  color: #6b7280;
 }
 
 .composer {
