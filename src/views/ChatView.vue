@@ -32,7 +32,9 @@ const API_BASE = 'http://127.0.0.1:8000'
 const STORAGE_KEY = 'ai-chat-conversation-id'
 const SYSTEM_PROMPT_KEY = 'ai-chat-system-prompt'
 const SYSTEM_PROMPT_PRESET_KEY = 'ai-chat-system-prompt-preset'
+const RAG_MODE_KEY = 'ai-chat-rag-mode'
 const systemPrompt = ref(localStorage.getItem(SYSTEM_PROMPT_KEY) || '')
+const ragEnabled = ref(localStorage.getItem(RAG_MODE_KEY) === '1')
 const CUSTOM_PRESET_KEY = 'custom'
 const systemPromptPresets = [
   {
@@ -97,6 +99,10 @@ watch(systemPrompt, (value) => {
 })
 watch(systemPromptPreset, (value) => {
   localStorage.setItem(SYSTEM_PROMPT_PRESET_KEY, value)
+})
+watch(ragEnabled, (value) => {
+  // 淇濆瓨鈥滅煡璇嗗簱妯″紡鈥濆紑鍏筹紝鏂逛究涓嬫杩涘叆缁х画浣跨敤銆?
+  localStorage.setItem(RAG_MODE_KEY, value ? '1' : '0')
 })
 
 // 派生 UI 状态。
@@ -523,9 +529,18 @@ const streamChat = async ({ content = '', continueFromLast = false } = {}) => {
       conversation_id: conversationId.value,
       continue_from_last: continueFromLast,
       system_prompt: systemPrompt.value,
-      system_prompt_preset: systemPromptPreset.value === CUSTOM_PRESET_KEY ? null : systemPromptPreset.value
+      system_prompt_preset: systemPromptPreset.value === CUSTOM_PRESET_KEY ? null : systemPromptPreset.value,
+      rag_enabled: ragEnabled.value,
+      rag_top_k: 4
     }
-    if (!continueFromLast) body.content = messageContent
+    if (!continueFromLast) {
+      body.content = messageContent
+      const trimmedSystemPrompt = systemPrompt.value.trim()
+      body.messages = [
+        ...(trimmedSystemPrompt ? [{ role: 'system', content: trimmedSystemPrompt }] : []),
+        { role: 'user', content: messageContent }
+      ]
+    }
 
     const res = await fetch(`${API_BASE}/chat/stream`, {
       method: 'POST',
@@ -795,6 +810,10 @@ onBeforeUnmount(() => {
                   {{ preset.label }}
                 </option>
               </select>
+              <label class="rag-mode-switch">
+                <input v-model="ragEnabled" type="checkbox" :disabled="loading || switchingConversation" />
+                <span>知识库模式</span>
+              </label>
             </div>
             <button
               class="system-prompt-clear"
@@ -854,13 +873,14 @@ onBeforeUnmount(() => {
 :global(#app) {
   width: 100%;
   margin: 0;
-  min-height: 100vh;
+  height: 100%;
   text-align: left;
   border: none;
 }
 
 .app-shell {
-  height: 100vh;
+  position: relative;
+  height: 100%;
   display: flex;
   flex-direction: column;
   background: #ffffff;
@@ -868,14 +888,15 @@ onBeforeUnmount(() => {
 }
 
 .topbar {
-  position: fixed;
-  top: 12px;
-  left: 16px;
-  right: 16px;
+  position: sticky;
+  top: 0;
+  left: 0;
+  right: 0;
   height: 52px;
   display: flex;
   align-items: center;
   gap: 10px;
+  margin: 12px 16px 0;
   padding: 0 12px;
   border: 1px solid #e5e7eb;
   border-radius: 12px;
@@ -902,14 +923,14 @@ onBeforeUnmount(() => {
 }
 
 .drawer-backdrop {
-  position: fixed;
+  position: absolute;
   inset: 0;
   background: rgba(15, 23, 42, 0.28);
   z-index: 20;
 }
 
 .modal-backdrop {
-  position: fixed;
+  position: absolute;
   inset: 0;
   z-index: 40;
   background: rgba(15, 23, 42, 0.42);
@@ -978,10 +999,10 @@ onBeforeUnmount(() => {
 }
 
 .drawer {
-  position: fixed;
+  position: absolute;
   top: 0;
   left: 0;
-  height: 100vh;
+  height: 100%;
   width: 280px;
   background: #ffffff;
   border-right: 1px solid #e5e7eb;
@@ -1109,7 +1130,7 @@ onBeforeUnmount(() => {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  height: 100vh;
+  height: 100%;
   overflow: hidden;
 }
 
@@ -1117,7 +1138,7 @@ onBeforeUnmount(() => {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 82px 0 18px;
+  padding: 18px 0 18px;
   background: #ffffff;
 }
 
@@ -1315,6 +1336,19 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 8px;
   min-width: 0;
+}
+
+.rag-mode-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #374151;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.rag-mode-switch input {
+  margin: 0;
 }
 
 .system-prompt-select {

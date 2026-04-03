@@ -51,6 +51,13 @@
 
 body {
   margin: 0;
+  overflow: hidden;
+}
+
+html,
+body,
+#app {
+  height: 100%;
 }
 
 h1,
